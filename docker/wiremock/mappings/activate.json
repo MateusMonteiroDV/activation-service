@@ -1,0 +1,16 @@
+{
+  "request": {
+    "method": "POST",
+    "url": "/provider/v1/activate"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "jsonBody": {
+      "status": "ACTIVATED",
+      "message": "Produto ativado com sucesso pelo provedor externo"
+    }
+  }
+}
