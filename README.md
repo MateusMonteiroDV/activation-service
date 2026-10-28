@@ -1,0 +1,218 @@
+# Serviço de Ativação de Produtos de Clientes (activation-service)
+
+Microsserviço backend em **Java 21 LTS** e **Spring Boot 3.3.5** responsável por registrar solicitações de ativação de produtos de clientes, consultar seus status e integrá-las de forma confiável e assíncrona a um provedor externo.
+
+Desenvolvido para o processo seletivo da **Deroyque IT Consulting Services**.
+
+---
+
+## Sumário
+1. [Visão Geral e Arquitetura](#visão-geral-e-arquitetura)
+2. [Como Executar](#como-executar)
+   - [Pré-requisitos](#pré-requisitos)
+   - [Execução com Docker Compose (Recomendado)](#execução-com-docker-compose-recomendado)
+   - [Execução Local via Maven](#execução-local-via-maven)
+   - [Execução de Testes](#execução-de-testes)
+3. [Decisões Técnicas](#decisões-técnicas)
+   - [Estratégia Anti-Duplicidade e Idempotência (Item 3)](#estrategia-anti-duplicidade-e-idempotência-item-3)
+   - [Comportamento da Integração com o Provedor (Item 5)](#comportamento-da-integração-com-o-provedor-item-5)
+   - [Segurança, OAuth 2.0 e Prevenção BOLA (Item 7)](#segurança-oauth-20-e-prevenção-bola-item-7)
+4. [Cenário de Análise de Produção (Item 10)](#cenário-de-análise-de-produção-item-10)
+5. [Operação em Produção e Docker (Item 11)](#operação-em-produção-e-docker-item-11)
+6. [Microsserviços em Nuvem (Diferenciais de Arquitetura)](#microsserviços-em-nuvem-diferenciais-de-arquitetura)
+7. [Pontos Pendentes e Melhorias Futuras](#pontos-pendentes-e-melhorias-futuras)
+8. [Uso de Ferramentas de IA](#uso-de-ferramentas-de-ia)
+
+---
+
+## Visão Geral e Arquitetura
+
+O serviço foi estruturado pelo padrão **Package-by-Feature** focado em simplicidade, manutenibilidade e alta robustez sob concorrência, evitando camadas redundantes ou padrões desnecessários (*overengineering*):
+
+```
+com.deroyque.activation
+├── request/                       # Ciclo de vida da ativação
+│   ├── api/                       # REST Controller, DTOs (records), validação Bean Validation
+│   ├── application/               # Casos de uso e Worker assíncrono (SKIP LOCKED)
+│   └── domain/                    # Entidade JPA rica com transições controladas e Repository
+├── provider/                      # Integração com provedor externo (RestClient, Timeouts, WireMock)
+└── shared/                        # Transversais (OAuth2 Security, ProblemDetail RFC 9457, MDC Tracing)
+```
+
+### Ciclo de Vida da Solicitação
+```
+  [PENDING]  ──(Claim do Worker)──►  [PROCESSING]
+                                          │
+                        ┌─────────────────┴─────────────────┐
+                        ▼                                   ▼
+                   [COMPLETED]                           [FAILED]
+                        ▲
+                        └──(Retry transitório com backoff volta a PENDING)
+```
+
+---
+
+## Como Executar
+
+### Pré-requisitos
+- **Java 21 LTS** (recomendado Eclipse Temurin)
+- **Docker** e **Docker Compose**
+
+### Execução com Docker Compose (Recomendado)
+Sobe a aplicação, o banco PostgreSQL 16 e o mock do provedor via WireMock em um único comando:
+
+```bash
+docker compose up --build
+```
+
+A API estará disponível em `http://localhost:8080`.
+- **Health Check**: `http://localhost:8080/actuator/health`
+- **Métricas Prometheus**: `http://localhost:8080/actuator/prometheus`
+
+### Execução Local via Maven
+Se preferir executar a aplicação localmente conectando a um PostgreSQL:
+
+```bash
+# Definir variáveis de ambiente se necessário
+export SPRING_DATASOURCE_URL=jdbc:postgresql://localhost:5432/activation_db
+export SPRING_DATASOURCE_USERNAME=postgres
+export SPRING_DATASOURCE_PASSWORD=postgrespassword
+export PROVIDER_URL=http://localhost:8081
+
+./mvnw spring-boot:run
+```
+
+### Execução de Testes
+Os testes automatizados cobrem testes unitários puros, fatias web (`@WebMvcTest`), mocks de rede com WireMock, testes de arquitetura com **ArchUnit** e testes de integração de concorrência com banco real via **Testcontainers**:
+
+```bash
+# Executa todos os 40 testes automatizados
+./mvnw clean verify
+```
+
+---
+
+## Decisões Técnicas
+
+As decisões arquiteturais detalhadas estão documentadas em [`docs/adr/`](docs/adr/).
+
+### Estratégia Anti-Duplicidade e Idempotência (Item 3)
+*Consulte o [ADR 0002](docs/adr/0002-estrategia-anti-duplicidade-idempotencia.md).*
+
+- **Por que `SELECT` antes de `INSERT` não basta sozinho?**
+  Em sistemas concorrentes, duas requisições idênticas podem executar o `SELECT` na mesma fração de milissegundo. Ambas recebem "não existe" e tentam o `INSERT`, gerando duplicidade ou quebrando a aplicação se o banco não estiver preparado.
+- **Solução Adotada**:
+  1. Constraint única física no banco: `CONSTRAINT uk_activation_request_external_id UNIQUE (external_id)`.
+  2. Inserção sem lock pessimista prévio. Caso ocorra `DataIntegrityViolationException`, a transação é descartada e o registro vencedor é consultado.
+  3. **Semântica da Resposta**:
+     - **Novo**: Retorna `201 Created` com cabeçalho `Location: /api/v1/requests/{id}`.
+     - **Retry Legítimo** (mesmo `externalId` e mesmo conteúdo): Retorna `200 OK` com o registro existente.
+     - **Conflito Malicioso/Divergente** (mesmo `externalId` com produto ou cliente diferente): Retorna `409 Conflict` (ProblemDetail RFC 9457).
+     - **Requisições Concorrentes Simultâneas**: Uma thread recebe `201`, as demais recebem `200`.
+
+### Comportamento da Integração com o Provedor (Item 5)
+*Consulte o [ADR 0003](docs/adr/0003-processamento-assincrono-outbox-com-skip-locked.md) e o [ADR 0004](docs/adr/0004-resiliencia-provedor-externo.md).*
+
+- **Processamento Assíncrono com Outbox no Banco**:
+  O `POST /api/v1/requests` apenas grava a solicitação como `PENDING` e responde imediatamente. Um worker com agendamento busca lotes com `FOR UPDATE SKIP LOCKED`, desacoplando a API da latência externa e garantindo que a conexão com o banco não fique aberta durante chamadas de rede.
+
+- **Comportamento por Retorno**:
+
+| Retorno do Provedor | Novo Status | Nova Tentativa? | Justificativa |
+| :--- | :--- | :--- | :--- |
+| **Sucesso (2xx)** | `COMPLETED` | Não | Produto ativado com sucesso. |
+| **HTTP 400 / 422** | `FAILED` | Não | Erro de negócio permanente (parâmetros inválidos). Repetir geraria o mesmo erro. |
+| **HTTP 500 / 502 / 504** | `PENDING` | Sim (com backoff) | Falha transitória do provedor. Remarcada com backoff exponencial + full jitter. |
+| **Timeout / Erro de Rede** | `PENDING` | Sim (com Idempotency-Key) | O provedor pode ter ativado ou não. O envio do header `Idempotency-Key: <requestId>` garante que a repetição não ative o produto duas vezes. |
+| **HTTP 429 / 503 com Retry-After**| `PENDING` | Sim (respeitando header) | O provedor solicitou pausa por excesso de carga. O serviço agenda o retry após o intervalo exigido. |
+| **Teto de Tentativas (5x)** | `FAILED` | Não | Evita consumo indefinido de recursos. Registra motivo detalhado em `last_error`. |
+
+### Segurança, OAuth 2.0 e Prevenção BOLA (Item 7)
+*Consulte o [ADR 0005](docs/adr/0005-seguranca-resource-server-isolamento-bola.md).*
+
+1. **OAuth 2.0 Resource Server**:
+   - Comunicação Machine-to-Machine (M2M) segura baseada no fluxo **Client Credentials**.
+   - Validação criptográfica de tokens JWT (assinatura via JWKS, emissor `iss`, expiração `exp` e audiência `aud`).
+2. **Autorização Granular por Escopo**:
+   - Criação (`POST /api/v1/requests`): Exige `SCOPE_activation:write`.
+   - Consulta (`GET /api/v1/requests/**`): Exige `SCOPE_activation:read`.
+   - Actuator: endpoints `/actuator/health/**`, `/info` e `/prometheus` liberados para coleta de métricas.
+3. **Isolamento de Consumidores (OWASP API1:2023 - BOLA)**:
+   - Toda solicitação registra o `client_id` extraído do JWT.
+   - Um consumidor **nunca** consegue consultar ou listar solicitações de outro consumidor. Tentativas resultam em `404 Not Found` para não expor a existência de IDs de terceiros.
+
+---
+
+## Cenário de Análise de Produção (Item 10)
+
+### O Problema
+Após o deploy em produção, a latência média da API subiu de **300 ms para 2,5 s**, enquanto a CPU permaneceu em **45%** e a Memória em **60%**. O provedor externo subiu de **400 ms para 3 s** e algumas queries de banco subiram de **50 ms para 1,2 s**.
+
+### 1. O que você investigaria primeiro?
+A primeira ação é correlacionar as métricas de tempo distribuído: o aumento na API (de 300ms para 2,5s) é praticamente idêntico ao aumento de tempo do serviço externo (de 400ms para 3s). Como a CPU (45%) e a Memória (60%) estão saudáveis, o sintoma clássico é de **threads bloqueadas em I/O síncrono** aguardando resposta de rede.
+
+### 2. Como identificaria se o problema está na aplicação, no banco ou na integração?
+- **Logs estruturados com Correlation ID / Tracing (OpenTelemetry / Micrometer Observation)**:
+  Analisar spans da requisição para verificar onde o tempo é consumido (ex.: span de HTTP client vs. span de JDBC connection).
+- **Métricas do HikariCP**:
+  Verificar `hikaricp.connections.active`, `hikaricp.connections.pending` e `hikaricp.connections.acquire.time`. Se as conexões ativas estiverem esgotadas, as queries no banco sobem de 50ms para 1,2s não porque o SQL é lento, mas porque a thread está esperando uma conexão livre no pool.
+
+### 3. Os três sintomas podem ter uma causa comum? (Diferencial)
+**Sim. A hipótese provável é a chamada HTTP ao provedor externo estar sendo executada dentro de uma transação aberta do banco de dados (padrão Connection-Leaking / Transactional over HTTP):**
+1. O provedor externo ficou lento (3s).
+2. Cada thread da aplicação abre uma transação JPA (`@Transactional`), faz um `SELECT`/`INSERT` e, em seguida, dispara a requisição HTTP segurando a conexão do banco aberta por 3 segundos.
+3. O pool do HikariCP (ex.: padrão de 10 conexões) esgota rapidamente.
+4. As outras consultas simples do banco agora levam 1,2s porque passam 1,15s na fila esperando uma conexão do pool ser liberada.
+5. As requisições na API enfileiram no Tomcat/Jetty, levando o tempo médio para 2,5s sem consumir CPU excessiva (threads estão no estado `WAITING`/`TIMED_WAITING`).
+
+### 4. Que tipo de melhoria seria considerada?
+- **Arquitetura Assíncrona / Padrão Outbox (implementada neste projeto)**:
+  Remover qualquer chamada remota de dentro do escopo de transações de banco. A API grava o registro em transação rápida (< 5ms) e o worker processa em segundo plano.
+- **Timeouts Agressivos e Circuit Breaker**:
+  Configurar connection timeout (ex.: 1s) e read timeout (ex.: 2s) no cliente HTTP com Resilience4j para abrir o circuito caso o provedor degrade.
+
+### 5. Como validar que a correção funcionou após publicação?
+1. **Canary Deployment**: Direcionar uma fração do tráfego (ex.: 5%) e monitorar os dashboards do Prometheus/Grafana.
+2. **Métricas de Sucesso**:
+   - Latência da API (`http.server.requests` percentil p95 e p99) normalizada para < 100ms.
+   - `hikaricp.connections.pending` zerado.
+   - Latência das queries de banco retornando para < 50ms.
+
+---
+
+## Operação em Produção e Docker (Item 11)
+
+- **Dockerfile Multi-Stage**:
+  - Imagem base de compilação: `eclipse-temurin:21-jdk-alpine`.
+  - Imagem de runtime enxuta: `eclipse-temurin:21-jre-alpine` (~140MB).
+  - Execução sob usuário restrito sem privilégios (`appuser:10001`).
+  - Flags de contêiner JVM: `-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError`.
+  - Probes nativos de Liveness e Readiness integrados no Docker Healthcheck.
+
+---
+
+## Microsserviços em Nuvem (Diferenciais de Arquitetura)
+
+1. **Múltiplas Instâncias Simultâneas**:
+   - O uso de `FOR UPDATE SKIP LOCKED` no PostgreSQL permite escalar horizontalmente instâncias do `activation-service` sem necessidade de locks distribuídos complexos (ex.: Redis/Redlock). Cada instância captura lotes distintos da fila sem bloqueio mútuo.
+2. **Gerenciamento de Segredos e Configurações**:
+   - Nenhuma credencial é versionada em código. Em nuvem (AWS/GCP/Azure), configurações ficam em variáveis de ambiente injetadas via **AWS Secrets Manager**, **HashiCorp Vault** ou Kubernetes Secrets.
+3. **Comunicação Orientada a Eventos**:
+   - Ao transicionar uma solicitação para `COMPLETED` ou `FAILED`, o worker pode publicar um evento em um tópico **Apache Kafka** ou **RabbitMQ** (`activation.events`), permitindo que outros serviços reajam sem acoplamento síncrono.
+4. **Pipeline de CI/CD**:
+   - Configurado via GitHub Actions (`.github/workflows/ci.yml`): checagem estática, testes unitários, testes com Testcontainers, verificação de regras arquiteturais (ArchUnit) e build da imagem Docker.
+
+---
+
+## Pontos Pendentes e Melhorias Futuras
+
+Caso o serviço fosse evoluir em ambiente corporativo de larga escala:
+- Implementar **OpenTelemetry** com agente ou biblioteca de distributed tracing integrado ao Jaeger/Grafana Tempo.
+- Substituir o polling do worker por uma fila de mensageria dedicada (ex.: Kafka/SQS com Transactional Outbox CDC via Debezium) quando o volume superar dezenas de milhares de requisições por segundo.
+- Adicionar documentação OpenAPI/Swagger interativa via `springdoc-openapi`.
+
+---
+
+## Uso de Ferramentas de IA
+Conforme encorajado nas diretrizes do processo seletivo:
+- **Onde foi usada**: Auxílio na criação do esqueleto inicial de testes automatizados, verificação de sintaxe de regras do ArchUnit e revisão gramatical da documentação técnica. Toda a concepção arquitetural, modelagem de domínio, controle de concorrência com locks e decisões técnicas foram validadas e testadas contra cenários reais de execução.
