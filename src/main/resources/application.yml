@@ -16,10 +16,32 @@ spring:
   flyway:
     enabled: true
     baseline-on-migrate: true
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: ${JWK_SET_URI:https://auth.exemplo.com/.well-known/jwks.json}
 
 server:
   port: ${PORT:8080}
   shutdown: graceful
+
+provider:
+  url: ${PROVIDER_URL:http://localhost:8081}
+  connect-timeout: 2s
+  read-timeout: 3s
+  max-attempts: 5
+  initial-backoff: 2s
+  backoff-multiplier: 2.0
+  max-backoff: 60s
+  batch-size: 20
+  stuck-timeout: 5m
+
+activation:
+  processor:
+    interval-ms: 2000
+  reconciler:
+    interval-ms: 60000
 
 management:
   endpoints:
@@ -31,3 +53,6 @@ management:
       show-details: when_authorized
       probes:
         enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}

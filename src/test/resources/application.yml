@@ -1,0 +1,27 @@
+spring:
+  application:
+    name: activation-service
+  flyway:
+    enabled: true
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: https://auth.test/.well-known/jwks.json
+
+activation:
+  processor:
+    interval-ms: 10000000
+  reconciler:
+    interval-ms: 10000000
+
+provider:
+  url: http://localhost:8081
+  connect-timeout: 500ms
+  read-timeout: 1000ms
+  max-attempts: 3
+  initial-backoff: 100ms
+  backoff-multiplier: 2.0
+  max-backoff: 500ms
+  batch-size: 10
+  stuck-timeout: 1m
