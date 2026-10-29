@@ -8,15 +8,18 @@ Desenvolvido para o processo seletivo da **Deroyque IT Consulting Services**.
 
 ## Sumário
 1. [Visão Geral e Arquitetura](#visão-geral-e-arquitetura)
+   - [Endpoints da API e Modelo de Domínio](#endpoints-da-api-e-modelo-de-domínio)
+   - [Ciclo de Vida da Solicitação e Concorrência](#ciclo-de-vida-da-solicitação-e-concorrência-de-domínio)
 2. [Como Executar](#como-executar)
    - [Pré-requisitos](#pré-requisitos)
    - [Execução com Docker Compose (Recomendado)](#execução-com-docker-compose-recomendado)
    - [Execução Local via Maven](#execução-local-via-maven)
-   - [Execução de Testes](#execução-de-testes)
+   - [Execução e Estratégia de Testes (Item 8)](#execução-e-estratégia-de-testes-item-8---diferencial)
 3. [Decisões Técnicas](#decisões-técnicas)
    - [Estratégia Anti-Duplicidade e Idempotência (Item 3)](#estrategia-anti-duplicidade-e-idempotência-item-3)
    - [Comportamento da Integração com o Provedor (Item 5)](#comportamento-da-integração-com-o-provedor-item-5)
    - [Segurança, OAuth 2.0 e Prevenção BOLA (Item 7)](#segurança-oauth-20-e-prevenção-bola-item-7)
+   - [Estratégia e Justificativa de Índices no Banco (Item 2)](#estratégia-e-justificativa-de-índices-no-banco-item-2---diferencial)
 4. [Cenário de Análise de Produção (Item 10)](#cenário-de-análise-de-produção-item-10)
 5. [Operação em Produção e Docker (Item 11)](#operação-em-produção-e-docker-item-11)
 6. [Microsserviços em Nuvem (Diferenciais de Arquitetura)](#microsserviços-em-nuvem-diferenciais-de-arquitetura)
@@ -39,7 +42,20 @@ com.deroyque.activation
 └── shared/                        # Transversais (OAuth2 Security, ProblemDetail RFC 9457, MDC Tracing)
 ```
 
-### Ciclo de Vida da Solicitação
+### Endpoints da API e Modelo de Domínio
+
+| Método | Endpoint | Escopo OAuth2 | Descrição |
+| :--- | :--- | :--- | :--- |
+| `POST` | `/api/v1/requests` | `SCOPE_activation:write` | Cria solicitação (`201 Created` com header `Location`) ou reconhece retry legítimo (`200 OK`). |
+| `GET` | `/api/v1/requests/{id}` | `SCOPE_activation:read` | Consulta o status da solicitação (`200 OK` ou `404 Not Found` ProblemDetail). |
+| `GET` | `/api/v1/requests?status=&customerId=&page=&size=` | `SCOPE_activation:read` | Listagem paginada e filtrada, com ordenação decrescente por data de criação. |
+
+#### Regras de Validação (Bean Validation)
+- `externalId`, `customerId` e `productCode`: Obrigatórios (`@NotBlank`), máximo de 64 caracteres (`@Size(max = 64)`), aceitando apenas caracteres alfanuméricos, ponto, hífen e sublinhado (`^[A-Za-z0-9._-]*$`).
+- **DTOs**: Records Java 21 imutáveis estritamente separados das entidades JPA.
+- **Datas**: Serializadas sempre em UTC no padrão ISO-8601 (`Instant`, ex.: `2026-10-26T14:03:11Z`).
+
+### Ciclo de Vida da Solicitação e Concorrência de Domínio
 ```
   [PENDING]  ──(Claim do Worker)──►  [PROCESSING]
                                           │
@@ -49,6 +65,10 @@ com.deroyque.activation
                         ▲
                         └──(Retry transitório com backoff volta a PENDING)
 ```
+
+- **Transições controladas pelo domínio**: A entidade `ActivationRequest` não possui *setters* livres. Todas as alterações de status passam pelo método interno `transitionTo`, que valida a máquina de estados (ex.: `COMPLETED` não pode voltar para `PROCESSING`).
+- **Comportamento em falhas temporárias**: Em caso de falha transitória do provedor (5xx, 429 ou Timeout), a solicitação **retorna para `PENDING`** com `next_attempt_at` calculado por backoff exponencial com *jitter*. Isso é fundamental para liberar a thread e o lock imediatamente, permitindo que o worker processe outras requisições prioritárias enquanto aguarda o intervalo de retry sem que o reconciliador considere a tarefa perdida.
+- **Proteção Concorrente de Domínio**: Campo `@Version private Long version` com *optimistic locking* para proteger contra escritas concorrentes sobre a mesma solicitação.
 
 ---
 
@@ -82,11 +102,21 @@ export PROVIDER_URL=http://localhost:8081
 ./mvnw spring-boot:run
 ```
 
-### Execução de Testes
-Os testes automatizados cobrem testes unitários puros, fatias web (`@WebMvcTest`), mocks de rede com WireMock, testes de arquitetura com **ArchUnit** e testes de integração de concorrência com banco real via **Testcontainers**:
+### Execução e Estratégia de Testes (Item 8 - Diferencial)
+
+A estratégia de testes divide as responsabilidades em níveis para maximizar a confiança com o menor tempo de feedback possível:
+
+| Nível / Tipo de Teste | Classes / Escopo | Motivação (*Por quê*) |
+| :--- | :--- | :--- |
+| **Unitário de Domínio** | `ActivationRequestTest` | Roda em milissegundos sem inicializar o Spring. Testa transições de estado válidas, tentativas e bloqueio de transições ilegais (`InvalidStatusTransitionException`). |
+| **Unitário de Aplicação** | `ActivationProcessorTest`, `ActivationRequestServiceTest` | Testa algoritmos de backoff com *jitter*, reconciliação de tarefas presas e regras de negócio com dependências mockadas via Mockito. |
+| **Fatia Web (`@WebMvcTest`)** | `ActivationRequestControllerTest` | Valida serialização JSON, anotações de validação (`@Valid`), tratamento RFC 9457 ProblemDetail, cabeçalhos (`Location`) e segurança OAuth2 (respostas 401 para requisições anônimas e 403 para escopos insuficientes). |
+| **Integração de Rede (WireMock)** | `HttpProviderClientTest` | Testa o cliente HTTP real (`RestClient`) contra contratos de rede reais (timeouts de conexão/leitura, cabeçalhos `Idempotency-Key`, `Retry-After`, status 400, 429 e 500) sem dependência externa frágil. |
+| **Integração com Banco Real (Testcontainers)** | `ConcurrencyIntegrationTest` | Executa 10 threads simultâneas contra um contêiner oficial do **PostgreSQL 16**. Essencial para garantir que a constraint física de unicidade e a captura de `DataIntegrityViolationException` se comportem exatamente como em produção, evitando falsos positivos comuns ao H2. |
+| **Arquitetura (ArchUnit)** | `ArchitectureTest` | Verifica automaticamente a conformidade com regras arquiteturais (ex.: o domínio não depende de camadas web ou de provedor). |
 
 ```bash
-# Executa todos os 40 testes automatizados
+# Executa todos os 40 testes automatizados (unitários + integração)
 ./mvnw clean verify
 ```
 
@@ -140,6 +170,28 @@ As decisões arquiteturais detalhadas estão documentadas em [`docs/adr/`](docs/
 3. **Isolamento de Consumidores (OWASP API1:2023 - BOLA)**:
    - Toda solicitação registra o `client_id` extraído do JWT.
    - Um consumidor **nunca** consegue consultar ou listar solicitações de outro consumidor. Tentativas resultam em `404 Not Found` para não expor a existência de IDs de terceiros.
+4. **Armazenamento e Rotação de Credenciais do Provedor**:
+   - **Armazenamento**: Em ambiente produtivo / nuvem, credenciais (como API keys, tokens de serviço e secrets de banco) são mantidas em um cofre gerenciado (**AWS Secrets Manager**, **Azure Key Vault** ou **HashiCorp Vault**) e injetadas na aplicação via variáveis de ambiente (`PROVIDER_API_KEY`) ou montadas como arquivos via Secrets do Kubernetes. Nenhuma credencial é versionada em código.
+   - **Estratégia de Rotação com Zero Downtime**:
+     1. O provedor externo disponibiliza suporte a *dual keys* (chave primária e secundária ativas simultaneamente).
+     2. Uma nova chave é gerada e atualizada no Secrets Manager.
+     3. A aplicação atualiza a credencial via endpoint de recarregamento (`/actuator/refresh`) com Spring Cloud Config ou através de um *rolling restart* gradual dos contêineres sem indisponibilidade.
+     4. Uma vez que todas as instâncias estejam autenticando com a nova credencial, a chave antiga é revogada no painel do provedor.
+
+### Estratégia e Justificativa de Índices no Banco (Item 2 - Diferencial)
+
+Os índices criados na migração Flyway `V1__create_activation_request.sql` foram desenhados para atender aos padrões reais de acesso e concorrência:
+
+1. `uk_activation_request_external_id UNIQUE (external_id)`:
+   - **Justificativa**: Garante fisicamente a unicidade por `externalId`, criando um índice B-Tree primário que assegura busca O(log N) em deduplicações e impede concorrência duplicada diretamente na engine do PostgreSQL.
+2. `idx_activation_request_pending ON activation_request (next_attempt_at) WHERE status = 'PENDING'`:
+   - **Justificativa**: **Índice parcial (*partial index*)**. O worker roda a cada 2 segundos buscando apenas registros com status `PENDING` cujo `next_attempt_at <= now()`. Conforme o histórico cresce (milhões de registros `COMPLETED` ou `FAILED`), esse índice indexa apenas uma fração ínfima de linhas ativas, mantendo o consumo de memória baixo e a busca do worker com `SKIP LOCKED` ultrarrápida.
+3. `idx_activation_request_processing ON activation_request (processing_started_at) WHERE status = 'PROCESSING'`:
+   - **Justificativa**: Índice parcial para a tarefa de reconciliação periódica encontrar rapidamente solicitações órfãs presas em `PROCESSING`.
+4. `idx_activation_request_client_customer ON activation_request (client_id, customer_id, created_at DESC)`:
+   - **Justificativa**: Atende à listagem paginada (`GET /api/v1/requests?customerId=...`). Como a segurança exige isolamento por consumidor (`client_id`), a cláusula de busca sempre inclui `client_id = ? AND customer_id = ?`. A inclusão de `created_at DESC` no índice composto permite que o PostgreSQL entregue os registros ordenados diretamente das folhas do índice, dispensando ordenações custosas em memória (*filesort*).
+5. `idx_activation_request_client_status ON activation_request (client_id, status, created_at DESC)`:
+   - **Justificativa**: Atende à listagem paginada filtrada por status (`GET /api/v1/requests?status=...`), garantindo a mesma performance e aproveitamento de paginação indexada.
 
 ---
 
